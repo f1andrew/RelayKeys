@@ -28,8 +28,21 @@
 #define ADD_NEW_DEV_PROCESS_TIMEOUT 30000 // in millseconds
 #define SWAP_CONN_PROCESS_TIMEOUT 30000   // in millseconds
 
+BLEUart bleuart; // uart over ble
 BLEDis bledis;
 BLEHidAdafruit blehid;
+
+typedef struct
+{
+  bool enable_app;
+  uint8_t rsv[31];
+} relay_keys_cfg_t;
+
+relay_keys_cfg_t cfg;
+
+int connectedDeviceCount = 0;
+int uart_active_millis = 0;
+bool is_uart_active = false;
 
 volatile uint32_t addDevProsStartTicks = 0;
 volatile uint8_t flag_addDevProsStarted = 0;
@@ -56,35 +69,40 @@ void save_devList_toFile(void)
 {
   file.open(FILENAME, FILE_O_WRITE);
 
+  Serial.print("App enable = ");
+  Serial.println(cfg.enable_app);
+  Serial.print("List has ");
+  Serial.print(bleDeviceNameListIndex);
+  Serial.println(" devices");
+
+  for (int i = 0; i < bleDeviceNameListIndex; i++)
+  {
+    Serial.print(i);
+    Serial.print(". ");
+    Serial.print(bleDeviceNameList[i]);
+    Serial.println();
+  }
   // file existed
   if (file)
   {
 
-    Serial.print("List has ");
-    Serial.print(bleDeviceNameListIndex);
-    Serial.println(" devices");
-
-    for (int i = 0; i < bleDeviceNameListIndex; i++)
+    if ((bleDeviceNameListIndex <= 15))
     {
-      Serial.print(i);
-      Serial.print(". ");
-      Serial.print(bleDeviceNameList[i]);
+      // file.truncate(file.size());
+      file.seek(0);
+      file.write((const uint8_t *)&cfg, sizeof(cfg));
+      file.write((const uint8_t *)&bleDeviceNameListIndex, 1);
+      file.write((const uint8_t *)bleDeviceNameList, sizeof(bleDeviceNameList));
+
+      Serial.print("Saving Device List to file ");
+      Serial.print(file.size());
       Serial.println();
+      file.close();
     }
-
-    // file.truncate(file.size());
-    file.seek(0);
-    file.write((const uint8_t *)bleDeviceNameList, sizeof(bleDeviceNameList));
-    file.write((const uint8_t *)&bleDeviceNameListIndex, 1);
-
-    Serial.print("Saving Device List to file ");
-    Serial.print(file.size());
-    Serial.println();
-    file.close();
   }
   else
   {
-    Serial.print(FILENAME " Write Failed");
+    Serial.println(FILENAME " Write Failed");
   }
 }
 
@@ -102,29 +120,35 @@ void load_devList_fromFile(void)
     bleDeviceNameListIndex = 0;
     memset(bleDeviceNameList, 0, sizeof(bleDeviceNameList));
 
-    file.read((void *)bleDeviceNameList, sizeof(bleDeviceNameList));
+    file.read((void *)&cfg, sizeof(cfg));
     file.read((void *)&bleDeviceNameListIndex, 1);
+    file.read((void *)bleDeviceNameList, sizeof(bleDeviceNameList));
 
-    if(bleDeviceNameListIndex > 15){
+    if (bleDeviceNameListIndex > 15)
+    {
       bleDeviceNameListIndex = 0;
     }
-    
-    Serial.print("List has ");
-    Serial.print(bleDeviceNameListIndex);
-    Serial.println(" devices");
 
-    for (int i = 0; i < bleDeviceNameListIndex; i++)
-    {
-      Serial.print(i);
-      Serial.print(". ");
-      Serial.print(bleDeviceNameList[i]);
-      Serial.println();
-    }
     file.close();
   }
   else
   {
-    Serial.print(FILENAME " Read Failed");
+    bleDeviceNameListIndex = 0;
+    Serial.println(FILENAME " Read Failed");
+  }
+
+  Serial.print("App enable = ");
+  Serial.println(cfg.enable_app);
+  Serial.print("List has ");
+  Serial.print(bleDeviceNameListIndex);
+  Serial.println(" devices");
+
+  for (int i = 0; i < bleDeviceNameListIndex; i++)
+  {
+    Serial.print(i);
+    Serial.print(". ");
+    Serial.print(bleDeviceNameList[i]);
+    Serial.println();
   }
 }
 
@@ -133,15 +157,20 @@ void setup()
   Serial.begin(115200);
   //while ( !Serial && millis() < 2000) delay(10);   // for nrf52840 with native usb
 
-  Bluefruit.begin();
+  Bluefruit.begin(2, 0);
   Bluefruit.setTxPower(4); // Check bluefruit.h for supported values
   Bluefruit.setName(BLE_NAME);
   Bluefruit.Periph.setConnectCallback(bleConnectCallback);
+  Bluefruit.Periph.setDisconnectCallback(bleDisconnectCallback);
 
   // Configure and Start Device Information Service
   bledis.setManufacturer("Ace Centre");
   bledis.setModel("RelayKeysv1");
   bledis.begin();
+
+  // Configure and Start BLE Uart Service
+  bleuart.begin();
+  bleuart.setRxCallback(bleuart_data_rx);
 
   /* Start BLE HID
    * Note: Apple requires BLE device must have min connection interval >= 20m
@@ -177,9 +206,12 @@ void startAdv(void)
 
   // Include BLE HID service
   Bluefruit.Advertising.addService(blehid);
+  // Include bleuart 128-bit uuid
+  //  Bluefruit.Advertising.addService(bleuart);
 
   // There is enough room for the dev name in the advertising packet
   Bluefruit.Advertising.addName();
+  //  Bluefruit.ScanResponse.addName();
 
   /* Start Advertising
    * - Enable auto advertising if disconnected
@@ -191,11 +223,139 @@ void startAdv(void)
    * https://developer.apple.com/library/content/qa/qa1931/_index.html   
    */
   Bluefruit.Advertising.restartOnDisconnect(true);
-  Bluefruit.Advertising.setInterval(32, 244); // in unit of 0.625 ms
+  Bluefruit.Advertising.setInterval(64, 320); // in unit of 0.625 ms
   Bluefruit.Advertising.setFastTimeout(30);   // number of seconds in fast mode
   Bluefruit.Advertising.start(0);             // 0 = Don't stop advertising after n seconds
 
   Serial.println("RelayKeys UP & Running");
+}
+
+typedef struct
+{
+  char thechar;
+  uint8_t button;
+} mouse_button_map_t;
+
+const mouse_button_map_t mouse_buttons_map[] = {
+    {'l', MOUSE_BUTTON_LEFT},
+    {'r', MOUSE_BUTTON_RIGHT},
+    {'m', MOUSE_BUTTON_MIDDLE},
+    {'b', MOUSE_BUTTON_BACKWARD},
+    {'f', MOUSE_BUTTON_FORWARD},
+    {'0', 0},
+};
+
+struct __attribute__((packed))
+{
+  char type;
+  union
+  {
+    uint8_t raw[18];
+    // mouse button command => b
+    struct __attribute__((packed))
+    {
+      char button;
+      char down;
+    } mouse_button;
+    // mouse move command => m
+    struct __attribute__((packed))
+    {
+      int8_t x;
+      int8_t y;
+    } mouse_move;
+    // mouse wheel command => w
+    struct __attribute__((packed))
+    {
+      int8_t x;
+      int8_t y;
+    } mouse_wheel;
+    // keycode command => k
+    struct __attribute__((packed))
+    {
+      uint8_t modifier;
+      uint8_t key_codes[6];
+    } keyboard;
+  };
+} ble_uart_cmd;
+
+void bleuart_data_rx(uint16_t len)
+{
+  if (!cfg.enable_app)
+  {
+    int cid = Bluefruit.connHandle();
+    Bluefruit.Connection(cid)->disconnect();
+  }
+  else
+  {
+    if (!is_uart_active)
+    {
+      char *ch = (char *)&ble_uart_cmd;
+      int cid = 1 - Bluefruit.connHandle();
+      if (cid < 0)
+      {
+        cid = 0;
+      }
+      int i = 0;
+      while (bleuart.available() && i < 19)
+      {
+        *ch = (uint8_t)bleuart.read();
+        Serial.write(*ch);
+        ch++;
+        i++;
+      }
+      //
+      switch (ble_uart_cmd.type)
+      {
+      case 'b':
+      {
+        uint8_t b = 0;
+        for (int c = 0; c < sizeof(mouse_buttons_map) / sizeof(mouse_buttons_map[0]);
+             c++)
+        {
+          if (mouse_buttons_map[c].thechar == ble_uart_cmd.mouse_button.button)
+          {
+            b = mouse_buttons_map[c].button;
+            break;
+          }
+        }
+        if (b)
+        {
+          if (ble_uart_cmd.mouse_button.down == 't')
+          {
+            blehid.mouseButtonPress(cid, b);
+          }
+          else
+          {
+            blehid.mouseButtonRelease(cid);
+          }
+        }
+      }
+      break;
+      case 'm':
+      {
+        blehid.mouseMove(cid, ble_uart_cmd.mouse_move.x, ble_uart_cmd.mouse_move.y);
+      }
+      break;
+      case 'w':
+      {
+        if (abs(ble_uart_cmd.mouse_wheel.x) > abs(ble_uart_cmd.mouse_wheel.y))
+        {
+          blehid.mousePan(cid, ble_uart_cmd.mouse_wheel.x);
+        }
+        else
+        {
+          blehid.mouseScroll(cid, ble_uart_cmd.mouse_wheel.y);
+        }
+      }
+      break;
+      case 'k':
+      {
+        blehid.keyboardReport(cid, ble_uart_cmd.keyboard.modifier, ble_uart_cmd.keyboard.key_codes);
+      }
+      break;
+      }
+    }
+  }
 }
 
 typedef void (*action_func_t)(char *myLine);
@@ -217,6 +377,56 @@ void toLower(char *s)
     }
     s++;
   }
+}
+
+void setBleUARTMode(char *myLine)
+{
+  Serial.println("at+setbleuartmode");
+  if (myLine)
+  {
+    if (strcmp(myLine, "on") == 0)
+    {
+      cfg.enable_app = true;
+      if (connectedDeviceCount < 2)
+      {
+        Bluefruit.Advertising.start(0);
+      }
+      save_devList_toFile();
+    }
+    else if (strcmp(myLine, "off") == 0)
+    {
+      cfg.enable_app = false;
+      save_devList_toFile();
+    }
+    else
+    {
+      Serial.println("=on/off required");
+      Serial.print("got =");
+      Serial.println(myLine);
+    }
+  }
+  else
+  {
+    Serial.println("=on/off required");
+  }
+}
+
+void clearDevList(char *myLine)
+{
+  Serial.println("at+bledevlistclear");
+  bool done = InternalFS.remove(FILENAME);
+  load_devList_fromFile();
+  if (done)
+  {
+    Serial.println('OK');
+  }
+  else
+  {
+    Serial.println('ERR');
+  }
+  // bleDeviceNameListIndex = 0;
+  // save_devList_toFile();
+  // Serial.println("OK");
 }
 
 void sendBLEMouseMove(char *line)
@@ -289,21 +499,6 @@ void sendBLEMouseMove(char *line)
     Serial.println("OK");
   }
 }
-
-typedef struct
-{
-  char thechar;
-  uint8_t button;
-} mouse_button_map_t;
-
-const mouse_button_map_t mouse_buttons_map[] = {
-    {'l', MOUSE_BUTTON_LEFT},
-    {'r', MOUSE_BUTTON_RIGHT},
-    {'m', MOUSE_BUTTON_MIDDLE},
-    {'b', MOUSE_BUTTON_BACKWARD},
-    {'f', MOUSE_BUTTON_FORWARD},
-    {'0', 0},
-};
 
 void sendBLEMouseButton(char *line)
 {
@@ -662,6 +857,8 @@ const command_action_t commands[] = {
     {"at+switchconn", switchBleConnection},
     {"at+printdevlist", printBleDevList},
     {"at+blemaxdevlistsize", setBleMaxDevListSize},
+    {"at+bledevlistclear", clearDevList},
+    {"at+setbleuartmode", setBleUARTMode},
 };
 
 void execute(char *myLine)
@@ -680,6 +877,8 @@ void execute(char *myLine)
       return;
     }
   }
+  is_uart_active = true;
+  uart_active_millis = millis();
   // Command not found so just send OK. Should send ERROR at some point.
   Serial.println("OK");
 }
@@ -773,10 +972,30 @@ void loop()
 
   // Request CPU to enter low-power mode until an event/interrupt occurs
   waitForEvent();
+
+  //
+  if ((millis() - uart_active_millis) > 10000)
+  {
+    is_uart_active = false;
+    uart_active_millis = millis();
+  }
+}
+
+void bleDisconnectCallback(uint16_t conn_handle, uint8_t reason)
+{
+  (void)conn_handle;
+  (void)reason;
+  connectedDeviceCount--;
+  if (connectedDeviceCount < 0)
+  {
+    connectedDeviceCount = 0;
+  }
+  Bluefruit.Advertising.start(0);
 }
 
 void bleConnectCallback(uint16_t conn_handle)
 {
+  connectedDeviceCount++;
   static int i;
   uint16_t connectionHandle = 0;
   BLEConnection *connection = NULL;
@@ -795,7 +1014,7 @@ void bleConnectCallback(uint16_t conn_handle)
     else
     {
       connection->disconnect();
-      Serial.println("Disconnected - Other device");
+      //Serial.println("Disconnected - Other device");
     }
   }
   else if (flag_bleSwapConnProsStarted == 2)
@@ -808,7 +1027,7 @@ void bleConnectCallback(uint16_t conn_handle)
     else
     {
       connection->disconnect();
-      Serial.println("Disconnected - Other device");
+      //Serial.println("Disconnected - Other device");
     }
   }
   else
@@ -819,11 +1038,11 @@ void bleConnectCallback(uint16_t conn_handle)
     {
       if (!strcmp((char *)central_name, (char *)bleDeviceNameList[i]))
       {
-        Serial.println("Device found in list - " + String(central_name));
+        //Serial.println("Device found in list - " + String(central_name));
         if (flag_addDevProsStarted)
         {
           connection->disconnect();
-          Serial.println("Disconnected - Device already present in list");
+          //Serial.println("Disconnected - Device already present in list");
         }
         else
         {
@@ -845,7 +1064,7 @@ void bleConnectCallback(uint16_t conn_handle)
         else
         {
           Serial.println("SUCCESS");
-          Serial.println(String(central_name) + " Connected and Name added into list");
+          //Serial.println(String(central_name) + " Connected and Name added into list");
           strcpy(bleDeviceNameList[bleDeviceNameListIndex++], central_name);
           flag_saveListToFile = true;
         }
@@ -853,9 +1072,13 @@ void bleConnectCallback(uint16_t conn_handle)
       else
       {
         connection->disconnect();
-        Serial.println(String(central_name) + " Disconnected - Not present in the list");
+        //Serial.println(String(central_name) + " Disconnected - Not present in the list");
       }
     }
+  }
+  if (cfg.enable_app && connectedDeviceCount < 2)
+  {
+    Bluefruit.Advertising.start(0);
   }
 }
 
